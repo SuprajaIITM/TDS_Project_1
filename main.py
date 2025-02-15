@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import PlainTextResponse
 import os
 import json
 import openai
@@ -17,17 +18,17 @@ app = FastAPI()
 data_dir = "/data/"
 
 token = os.getenv("AIPROXY_TOKEN")
+print(token)
 if not token:
     raise Exception("AIPROXY_TOKEN is not set. Please set it in the environment variables.")
 
-openai.api_base = "https://aiproxy.sanand.workers.dev/openai/v1"
+openai.api_base = "http://aiproxy.sanand.workers.dev/openai/v1"
 openai.api_key = token
-client = openai.OpenAI(api_key=token)
 
 def classify_task(task: str):
     """Uses GPT-4o-Mini to classify a task into predefined categories using few-shot examples."""
     try:
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are an assistant that maps tasks to predefined categories. Given a task description, return the correct category from this list: install_uv, format_md, count_weekdays, sort_contacts, extract_email, extract_credit_card_number, find_most_similar_comments, compute_gold_ticket_sales."},
@@ -89,7 +90,7 @@ def classify_task(task: str):
                 {"role": "user", "content": task}
             ]
         )
-
+        print("🔹 Raw Response:", response) 
         classified_task = response.choices[0].message.content.strip()
         return classified_task
 
@@ -285,18 +286,39 @@ def count_weekdays(weekday, input_file, output_file):
             if not date_str:
                 continue  # Skip empty lines
 
-            # 🔹 Try multiple date formats
             parsed_date = None
-            for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"]:
-                try:
-                    parsed_date = datetime.strptime(date_str, fmt)
-                    break  # If parsing is successful, exit loop
-                except ValueError:
-                    continue  # Try the next format
+            
+            # 🔹 Try Automatic Parsing First (Handles Most Cases)
+            try:
+                parsed_date = parser.parse(date_str)
+                
+            except Exception:
+                pass  # If automatic parsing fails, try manual formats
 
+            # 🔹 Try Manual Formats as Fallback
+            if not parsed_date:
+                for fmt in [
+                    "%Y-%m-%d", 
+                    "%Y/%m/%d", 
+                    "%d-%b-%Y",   # Example: 07-Mar-2011
+                    "%d-%B-%Y",   # Example: 07-March-2011
+                    "%b %d, %Y",  # Example: Aug 27, 2011
+                    "%B %d, %Y",  # Example: August 27, 2011
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y/%m/%d %H:%M:%S"
+                ]:
+                    try:
+                        parsed_date = datetime.datetime.strptime(date_str, fmt)
+                        break  # If parsing is successful, exit loop
+                    except ValueError:
+                        continue  # Try the next format
+
+            # 🔹 If parsed, check if it's the target weekday
             if parsed_date:
                 if parsed_date.strftime("%A") == weekday:
                     count += 1
+            else:
+                print(f"⚠️ Failed to parse: {date_str}")
 
         # 🔹 Write the count to the output file
         with open(output_path, "w") as f:
@@ -306,7 +328,7 @@ def count_weekdays(weekday, input_file, output_file):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 def sort_contacts():
     try:
         # 🔹 Define the local `data/` directory
@@ -386,7 +408,7 @@ def extract_email():
         with open(input_file, "r", encoding="utf-8") as f:
             email_content = f.read()
 
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "Extract only the sender's email address from the given email content."},
@@ -422,7 +444,7 @@ def extract_credit_card_number():
             base64_image = base64.b64encode(image_file.read()).decode("utf-8")
 
         
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": "Extract only the credit card number from the given image."},
@@ -537,12 +559,29 @@ def run(task: str = Query(..., description="Task to execute")):
     """Executes the given task."""
     return run_task(task)
 
-@app.get("/read")
-def read_file(path: str = Query(..., description="Path to the file")):
-    """Reads a file."""
-    check_path(path)
-    try:
-        with open(path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
+@app.get("/read", response_class=PlainTextResponse)
+async def read_file(path: str = Query(...)):
+    """
+    GET endpoint to read and return the content of a file.
+    Ensures only files under /data (as specified in the task) are accessed.
+    """
+    # Security check: Path must start with /data
+    if not path.startswith("/data"):
+        raise HTTPException(status_code=400, detail="Invalid file path: Must start with /data")
+    
+    # Translate the given path into a local path.
+    # Assuming your repository has a 'data' folder in its root,
+    # we remove the leading '/data' and join with the repository's data directory.
+    base_dir = os.path.join(os.getcwd(), "data")  # local data folder
+    relative_path = os.path.relpath(path, "/data")  # e.g. "sample.txt"
+    file_path = os.path.join(base_dir, relative_path)
+    
+    if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
+    
+    try:
+        with open(file_path, "r") as f:
+            content = f.read()
+        return content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
