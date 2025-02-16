@@ -11,6 +11,8 @@ import requests
 import re
 import base64
 import numpy as np
+from dateutil import parser
+import itertools
 
 
 app = FastAPI()
@@ -90,7 +92,7 @@ def classify_task(task: str):
                 {"role": "user", "content": task}
             ]
         )
-        print("🔹 Raw Response:", response) 
+        #print("🔹 Raw Response:", response) 
         classified_task = response.choices[0].message.content.strip()
         return classified_task
 
@@ -265,66 +267,67 @@ def format_md():
 
 def count_weekdays(weekday, input_file, output_file):
     try:
-        # 🔹 Ensure local `data/` directory is used
         local_data_dir = os.path.join(os.getcwd(), "data")
 
-        # 🔹 Construct local file paths
         input_path = os.path.join(local_data_dir, os.path.basename(input_file))
         output_path = os.path.join(local_data_dir, os.path.basename(output_file))
 
-        # 🔹 Ensure input file exists
         if not os.path.exists(input_path):
             raise Exception(f"File not found: {input_path}")
 
-        # 🔹 Read all dates from the file
         with open(input_path, "r") as f:
             raw_dates = [line.strip() for line in f.readlines()]
 
         count = 0
+        incorrect_parses = 0
 
         for date_str in raw_dates:
             if not date_str:
                 continue  # Skip empty lines
 
             parsed_date = None
-            
-            # 🔹 Try Automatic Parsing First (Handles Most Cases)
-            try:
-                parsed_date = parser.parse(date_str)
-                
-            except Exception:
-                pass  # If automatic parsing fails, try manual formats
 
-            # 🔹 Try Manual Formats as Fallback
+            # 🔹 First, try parsing with known formats explicitly
+            for fmt in [
+                "%Y-%m-%d",
+                "%Y/%m/%d",
+                "%d-%b-%Y",   # 07-Mar-2011
+                "%d-%B-%Y",   # 07-March-2011
+                "%b %d, %Y",  # Aug 27, 2011
+                "%B %d, %Y",  # August 27, 2011
+                "%Y-%m-%d %H:%M:%S",
+                "%Y/%m/%d %H:%M:%S"
+            ]:
+                try:
+                    parsed_date = datetime.strptime(date_str, fmt)
+                    break  # Exit if successfully parsed
+                except ValueError:
+                    continue  # Try next format
+
+            # 🔹 If no match found, try automatic parsing (as a fallback)
             if not parsed_date:
-                for fmt in [
-                    "%Y-%m-%d", 
-                    "%Y/%m/%d", 
-                    "%d-%b-%Y",   # Example: 07-Mar-2011
-                    "%d-%B-%Y",   # Example: 07-March-2011
-                    "%b %d, %Y",  # Example: Aug 27, 2011
-                    "%B %d, %Y",  # Example: August 27, 2011
-                    "%Y-%m-%d %H:%M:%S",
-                    "%Y/%m/%d %H:%M:%S"
-                ]:
-                    try:
-                        parsed_date = datetime.datetime.strptime(date_str, fmt)
-                        break  # If parsing is successful, exit loop
-                    except ValueError:
-                        continue  # Try the next format
+                try:
+                    parsed_date = parser.parse(date_str, dayfirst=True, fuzzy=False)
+                except Exception:
+                    incorrect_parses += 1
+                    print(f"⚠️ Failed to parse: {date_str}")
+                    continue  # Skip this entry
 
-            # 🔹 If parsed, check if it's the target weekday
-            if parsed_date:
-                if parsed_date.strftime("%A") == weekday:
-                    count += 1
-            else:
-                print(f"⚠️ Failed to parse: {date_str}")
-
+            # 🔹 Ensure we only count correctly parsed dates
+            if parsed_date.strftime("%A") == weekday:
+                print(parsed_date.weekday())
+                count += 1
+            
         # 🔹 Write the count to the output file
         with open(output_path, "w") as f:
             f.write(str(count))
 
-        return {"status": "success", "message": f"{weekday} count written to {output_path}", "count": count}
+        return {
+            "status": "success",
+            "message": f"{weekday} count written to {output_path}",
+            "count": count,
+            "failed_parses": incorrect_parses
+        }
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -445,10 +448,10 @@ def extract_credit_card_number():
 
         
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Extract only the credit card number from the given image."},
-                {"role": "user", "content": "Here's the image of a credit card.", "image": {"data": base64_image, "mime_type": "image/png"}}
+                {"role": "system", "content": "Extract only the number from the square box given image."},
+                {"role": "user", "content": "Here's the image of a square. Extract number", "image": {"data": base64_image, "mime_type": "image/png"}}
             ]
         )
 
@@ -482,33 +485,40 @@ def find_most_similar_comments():
         if len(comments) < 2:
             raise Exception("Not enough comments to compare.")
 
-        # 🔹 Compute embeddings for all comments
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=comments
+        # 🔹 Initialize OpenAI API with AIProxy
+        token = os.getenv("AIPROXY_TOKEN")
+        if not token:
+            raise Exception("❌ AIPROXY_TOKEN is NOT set! Check your environment variables.")
+
+        openai.api_base = "http://aiproxy.sanand.workers.dev/openai/v1"
+        openai.api_key = token
+
+        # 🔹 Get embeddings for all comments using GPT-4o-mini
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"Generate embeddings for these comments: {json.dumps(comments)}"}]
         )
 
-        embeddings = np.array([r.embedding for r in response.data])
+        # 🔹 Extract embeddings from the response
+        try:
+            embeddings = np.array(json.loads(response["choices"][0]["message"]["content"])["embeddings"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            raise Exception(f"⚠️ Failed to parse embeddings: {response}")
 
         # 🔹 Compute cosine similarity between all pairs
         num_comments = len(comments)
-        max_sim = -1
-        best_pair = None
+        similarity_matrix = np.dot(embeddings, embeddings.T)
+        
+        # Set self-similarity (diagonal elements) to -inf to ignore them
+        np.fill_diagonal(similarity_matrix, -np.inf)
 
-        for i in range(num_comments):
-            for j in range(i + 1, num_comments):  # Avoid redundant comparisons
-                sim = np.dot(embeddings[i], embeddings[j]) / (np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j]))
-                if sim > max_sim:
-                    max_sim = sim
-                    best_pair = (comments[i], comments[j])
-
-        if not best_pair:
-            raise Exception("Could not determine the most similar pair of comments.")
+        # 🔹 Get the most similar pair of comments
+        i, j = np.unravel_index(similarity_matrix.argmax(), similarity_matrix.shape)
+        best_pair = (comments[i], comments[j])
 
         # 🔹 Write the most similar comments to file
         with open(output_file, "w", encoding="utf-8") as f:
-            f.write(best_pair[0] + "\n")
-            f.write(best_pair[1] + "\n")
+            f.write("\n".join(sorted(best_pair)) + "\n")  # Sort for consistent ordering
 
         return {"status": "success", "message": f"Most similar comments saved to {output_file}", "comments": best_pair}
 
@@ -540,13 +550,13 @@ def extract_markdown_titles():
                             line = line.strip()
                             if line.startswith("# "):  # H1 heading found
                                 title = line[2:].strip()
-                                relative_path = os.path.relpath(file_path, docs_dir)  # Store relative path
+                                relative_path = os.path.relpath(file_path, docs_dir).replace("\\", "/")  # Store relative path
                                 index[relative_path] = title
                                 break  # Stop after the first H1
 
         # 🔹 Write the index JSON file
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(index, f, indent=2)
+            json.dump(index, f, indent=2, sort_keys=True)
 
         return {"status": "success", "message": f"Extracted H1 titles from {len(index)} markdown files.", "output_file": output_file}
 
